@@ -1,115 +1,93 @@
+# app.py (root directory)
 import streamlit as st
-import pandas as pd
 from src.agents.supply_chain_agent import SupplyChainAgent
+import sys
+from pathlib import Path
 
-# Page configuration
+# Configure Python path
+sys.path.insert(0, str(Path(__file__).parent))
+
+# Page Config
 st.set_page_config(
     page_title="Supply Chain Query Assistant",
-    page_icon="🚚",
+    page_icon="🚛",
     layout="wide"
 )
 
-# Initialize session state for pagination
-if 'offset' not in st.session_state:
-    st.session_state.offset = 0
-if 'limit' not in st.session_state:
-    st.session_state.limit = 10
-if 'last_query' not in st.session_state:
-    st.session_state.last_query = ""
-
-# Header
-st.title("Supply Chain Query Assistant")
-st.markdown("Ask questions about your supply chain data in natural language")
-
-# Initialize agent (use st.cache_resource to prevent reinitialization on rerun)
+# Initialize agent with caching
 @st.cache_resource
 def get_agent():
     return SupplyChainAgent()
 
-agent = get_agent()
-
-# Query input
-query = st.text_input("Enter your question:", 
-                     placeholder="e.g., Show 5 orders from Puerto Rico")
-
-# Pagination controls
-col1, col2 = st.columns([1, 4])
-with col1:
-    st.session_state.limit = st.number_input("Results per page:", 
-                                           min_value=5, max_value=50, value=st.session_state.limit)
-
-# Process query when submitted
-if query:
-    # Reset pagination when new query is submitted
-    if query != st.session_state.last_query:
-        st.session_state.offset = 0
-        st.session_state.last_query = query
+def main():
+    st.title("🔍 Supply Chain Query Assistant")
+    st.markdown("Ask natural language questions about your supply chain data")
     
-    # Execute query with pagination
-    response = agent.handle_query(
-        query, 
-        limit=st.session_state.limit, 
-        offset=st.session_state.offset
+    # Initialize session state
+    if 'page' not in st.session_state:
+        st.session_state.page = 1
+    
+    agent = get_agent()
+    
+    # Query Input
+    query = st.text_area(
+        "Enter your question:", 
+        placeholder="e.g., 'Show late deliveries from Puerto Rico'",
+        height=100
     )
     
-    # Display the SQL query used (in expandable section for developers)
-    with st.expander("SQL Query Used"):
-        st.code(response.get('query_used', 'No SQL query available'), language="sql")
+    # Pagination controls
+    col1, col2 = st.columns(2)
+    with col1:
+        limit = st.number_input("Results per page", min_value=1, max_value=50, value=10)
     
-    # Display results
-    st.subheader("Results")
-    
-    if response['status'] == 'success':
-        # Show textual response
-        st.markdown(response['response'])
-        
-        # If results exist, display as table too
-        if 'results' in response and len(response.get('results', [])) > 0:
-            st.dataframe(pd.DataFrame(response.get('results', [])))
+    # Process Query
+    if st.button("Submit Query", type="primary"):
+        if not query.strip():
+            st.warning("Please enter a question")
+            return
             
-            # Pagination navigation
-            pagination = response.get('pagination', {})
-            total = pagination.get('total', 0)
-            
-            col1, col2, col3 = st.columns([1, 2, 1])
-            
-            with col1:
-                if st.session_state.offset > 0:
-                    if st.button("⬅️ Previous Page"):
-                        st.session_state.offset = max(0, st.session_state.offset - st.session_state.limit)
+        with st.spinner("Analyzing your query..."):
+            try:
+                offset = (st.session_state.page - 1) * limit
+                response = agent.handle_query(query, limit=limit, offset=offset)
+                
+                # Display Results
+                st.subheader("Results")
+                st.markdown(response["response"])
+                
+                # Raw Data
+                with st.expander("View Raw Data"):
+                    if response['status'] == 'success':
+                        st.json(response.get('results', []))
+                
+                # Technical Details
+                with st.expander("Technical Details"):
+                    st.code(response.get('query_used', ''), language="sql")
+                    st.write("Pagination:", response.get('pagination', {}))
+                
+                # Pagination Controls
+                pagination = response.get('pagination', {})
+                if pagination.get('has_more', False) or st.session_state.page > 1:
+                    col1, col2, _ = st.columns([1, 1, 3])
+                    if col1.button("⬅️ Previous") and st.session_state.page > 1:
+                        st.session_state.page -= 1
+                        st.rerun()
+                    if col2.button("Next ➡️") and pagination.get('has_more', False):
+                        st.session_state.page += 1
                         st.rerun()
             
-            with col2:
-                st.markdown(f"Showing {st.session_state.offset + 1} to {min(st.session_state.offset + st.session_state.limit, total)} of {total} results")
-            
-            with col3:
-                if pagination.get('has_more', False):
-                    if st.button("Next Page ➡️"):
-                        st.session_state.offset += st.session_state.limit
-                        st.rerun()
-    
-    elif response['status'] == 'invalid':
-        st.warning(response['response'])
-    
-    else:
-        st.error(response['response'])
+            except Exception as e:
+                st.error(f"Error: {str(e)}")
 
-# Footer with instructions
-with st.expander("Usage Tips"):
-    st.markdown("""
-    - Ask questions in plain English about supply chain data
-    - You can ask about orders, deliveries, products, inventory, etc.
-    - Try being specific about what information you need
-    - Examples:
-        - "Show me late deliveries from last month"
-        - "List high-risk suppliers with pending orders"
-        - "What customers have the highest order values?"
-    """)
+    # Usage Tips
+    with st.expander("💡 Query Examples"):
+        st.markdown("""
+        - "Show orders with late deliveries"
+        - "List top 10 products by sales"
+        - "Which suppliers have pending shipments?"
+        - "Find orders from California last month"
+        """)
 
-# Clean up on page close
-def cleanup():
-    agent.close()
-
-# Register cleanup function
-import atexit
-atexit.register(cleanup)
+if __name__ == "__main__":
+    main()

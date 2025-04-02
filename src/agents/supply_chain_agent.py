@@ -5,18 +5,16 @@ from src.models.query_translator import OllamaQueryTranslator
 
 class SupplyChainAgent:
     """
-    Orchestrates query processing from natural language to database results.
-    Handles:
-    - Query translation
-    - Database operations
-    - Response formatting
-    - Pagination
+    Orchestrates end-to-end natural language query processing with:
     - Query validation
+    - Translation to SQL
+    - Paginated execution
+    - Result formatting
     """
 
     def __init__(self, db_path: str = 'supply_chain.db'):
         """
-        Initialize with database connection and query translator.
+        Initialize with database connection
         
         :param db_path: Path to SQLite database file
         """
@@ -24,91 +22,94 @@ class SupplyChainAgent:
         self.session = self.db_manager.get_session()
         self.translator = OllamaQueryTranslator(self.session)
         
-        # Supply chain related keywords for basic validation
-        self.supply_chain_keywords = [
-            "order", "delivery", "product", "supplier", "inventory", 
-            "shipment", "warehouse", "customer", "logistics", "stock",
-            "supply", "chain", "transport", "shipping", "purchase"
+        # Supply chain domain keywords for validation
+        self.domain_keywords = [
+            'order', 'shipment', 'inventory', 'supplier', 
+            'customer', 'delivery', 'product', 'warehouse',
+            'logistics', 'purchase', 'stock', 'shipping'
         ]
 
-    def _validate_query(self, user_query: str) -> bool:
+    def handle_query(self, 
+                   user_query: str, 
+                   limit: int = 10, 
+                   offset: int = 0) -> Dict[str, Union[str, List, Dict]]:
         """
-        Basic validation to check if query is relevant to supply chain.
+        Process natural language query with pagination
         
-        :param user_query: Natural language query string
-        :return: Boolean indicating query validity
-        """
-        query_lower = user_query.lower()
-        return any(keyword in query_lower for keyword in self.supply_chain_keywords)
-
-    def handle_query(self, user_query: str, limit: int = 10, offset: int = 0) -> Dict[str, Union[str, List, int]]:
-        """
-        End-to-end query processing pipeline with pagination.
-        
-        :param user_query: Natural language query string
-        :param limit: Maximum number of records to return
-        :param offset: Number of records to skip
-        :return: Dictionary with 'response' and metadata
+        :param user_query: Natural language question
+        :param limit: Results per page
+        :param offset: Pagination offset
+        :return: {
+            'response': str, 
+            'query_used': str,
+            'status': str,
+            'pagination': dict
+        }
         """
         try:
-            # Step 1: Validate query
-            if not self._validate_query(user_query):
+            # Step 1: Validate query relevance
+            if not self._is_valid_query(user_query):
                 return {
-                    "response": "Your query doesn't seem related to supply chain data. Please rephrase with relevant terms.",
-                    "status": "invalid"
+                    'response': 'Please ask supply chain related questions (e.g., orders, shipments)',
+                    'status': 'invalid'
                 }
+
+            # Step 2: Translate and execute
+            result = self.translator.translate_query(user_query, limit, offset)
             
-            # Step 2: Translate to executable query
-            translation = self.translator.translate_query(user_query, limit=limit, offset=offset)
-            
-            # Step 3: Calculate pagination metadata
-            total_count = translation.get('total_count', len(translation['results']))
-            
-            # Step 4: Format for user presentation
+            if 'error' in result:
+                raise ValueError(result['error'])
+
+            # Step 3: Format response
             return {
-                "response": self._format_response(translation['results']),
-                "query_used": translation['query'],  # For debugging
-                "status": "success",
-                "pagination": {
-                    "limit": limit,
-                    "offset": offset,
-                    "total": total_count,
-                    "has_more": offset + len(translation['results']) < total_count
+                'response': self._format_results(result['results']),
+                'query_used': result['query'],
+                'status': 'success',
+                'pagination': {
+                    'limit': limit,
+                    'offset': offset,
+                    'total': result.get('total_count', len(result['results'])),
+                    'has_more': (offset + limit) < result.get('total_count', float('inf'))
                 }
-            }
-            
-        except Exception as e:
-            return {
-                "response": f"Error processing query: {str(e)}",
-                "status": "error"
             }
 
-    def _format_response(self, results: List[Dict]) -> str:
+        except Exception as e:
+            return {
+                'response': f"Error: {str(e)}",
+                'status': 'error'
+            }
+
+    def _is_valid_query(self, query: str) -> bool:
+        """Check if query is supply chain related"""
+        query_lower = query.lower()
+        return any(keyword in query_lower for keyword in self.domain_keywords)
+
+    def _format_results(self, results: List[Dict]) -> str:
         """
-        Convert raw database results to human-readable format.
+        Convert raw results to human-readable format
         
-        :param results: List of database records as dictionaries
-        :return: Formatted string response
+        :param results: List of database rows as dicts
+        :return: Formatted string with samples
         """
         if not results:
             return "No matching records found."
         
-        samples = results[:3] if len(results) > 3 else results
-        formatted_samples = "\n\n".join(f"Record {i+1}:\n{self._dict_to_bullets(sample)}" 
-                                      for i, sample in enumerate(samples))
-        
-        return (
-            f"Found {len(results)} records.\n\n"
-            f"Sample results:\n{formatted_samples}"
+        # Display first 3 results as samples
+        sample_size = min(3, len(results))
+        samples = "\n\n".join(
+            f"Result {i+1}:\n" + "\n".join(f"- {k}: {v}" for k, v in row.items())
+            for i, row in enumerate(results[:sample_size])
         )
 
-    def _dict_to_bullets(self, data: Dict) -> str:
-        """Helper for dictionary formatting"""
-        return "\n".join(f"- {k}: {v}" for k, v in data.items() if v is not None)
+        return (
+            f"Found {len(results)} records\n\n"
+            f"Sample results:\n{samples}"
+        )
 
     def close(self):
-        """Clean up resources"""
+        """Clean up database resources"""
         self.session.close()
+        self.db_manager.engine.dispose()
 
 
 # Example Usage
@@ -116,24 +117,16 @@ if __name__ == "__main__":
     agent = SupplyChainAgent()
     
     try:
-        # Test queries with pagination
-        queries = [
-            "Show 5 orders from Puerto Rico",
-            "List late deliveries with high risk",
-            "What products had highest sales last month?"
-        ]
+        # Test basic query
+        print(agent.handle_query("Show 5 recent orders"))
         
-        for query in queries:
-            print(f"\nQuery: {query}")
-            # First page
-            response = agent.handle_query(query, limit=5, offset=0)
-            print(response['response'])
-            
-            # Simulate pagination if there are more results
-            if response.get('pagination', {}).get('has_more', False):
-                print("\nShowing next page...")
-                next_response = agent.handle_query(query, limit=5, offset=5)
-                print(next_response['response'])
+        # Test pagination
+        page1 = agent.handle_query("List shipments", limit=5, offset=0)
+        print(f"Page 1: {page1['response']}")
+        
+        if page1['pagination']['has_more']:
+            page2 = agent.handle_query("List shipments", limit=5, offset=5)
+            print(f"Page 2: {page2['response']}")
             
     finally:
         agent.close()

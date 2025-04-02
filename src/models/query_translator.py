@@ -1,78 +1,45 @@
-import os
-import sqlite3
+# src/models/query_translator.py
 import json
 import ollama
-from datetime import datetime
 from typing import List, Dict, Union
-
-class SupplyChainDB:
-    """Handles database setup and LLM-powered querying in one class"""
+from sqlalchemy.orm import Session
+from sqlalchemy import inspect
+import sqlite3
+class OllamaQueryTranslator:
+    """
+    Translates natural language queries to SQL and executes them using SQLAlchemy session
+    """
     
-    def __init__(self, db_path: str = 'supply_chain.db', csv_path: str = None, model: str = 'codellama:7b-instruct'):
+    def __init__(self, session: Session):
         """
-        Initialize database and LLM translator
+        Initialize with SQLAlchemy session
         
-        :param db_path: Path to SQLite database file
-        :param csv_path: Path to CSV data file (optional, only for initial setup)
-        :param model: Ollama model name for query translation
+        :param session: SQLAlchemy database session from DatabaseManager
         """
-        self.db_path = db_path
-        self.model = model
-        
-        # Initialize database if needed
-        if csv_path and not os.path.exists(self.db_path):
-            self._initialize_db(csv_path)
-            
-        # Verify database is ready
-        self._verify_db()
+        self.session = session
+        self.model = 'codellama:7b-instruct'
 
-    def _initialize_db(self, csv_path: str):
-        """Create database from CSV"""
-        import pandas as pd
-        from sqlalchemy import create_engine
-        
-        # Read and clean CSV
-        df = pd.read_csv(csv_path, parse_dates=['order date (DateOrders)', 'shipping date (DateOrders)'])
-        df.columns = [col.lower().replace(' ', '_').replace('(', '').replace(')', '') for col in df.columns]
-        
-        # Create SQLite database
-        engine = create_engine(f'sqlite:///{self.db_path}')
-        df.to_sql('supply_chain_orders', engine, index=False, if_exists='replace')
-        print(f"Database created at {self.db_path} with {len(df)} records")
-
-    def _verify_db(self):
-        """Check if database is accessible"""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            conn.execute("SELECT 1 FROM supply_chain_orders LIMIT 1")
-            conn.close()
-        except Exception as e:
-            raise RuntimeError(f"Database verification failed: {str(e)}")
-
-    def query(self, natural_query: str) -> Dict[str, Union[str, List[Dict]]]:
+    def translate_query(self, query: str, limit: int = None, offset: int = None) -> Dict[str, Union[str, List[Dict]]]:
         """
-        Execute natural language query against database
+        Main translation method with pagination support
         
-        :param natural_query: Query in plain English
-        :return: Dictionary with 'query' (SQL) and 'results' (data)
+        :param query: Natural language query
+        :param limit: Maximum results to return
+        :param offset: Results offset for pagination
+        :return: Dictionary with 'query', 'results', and 'total_count'
         """
         try:
             # Get schema context
             schema = self._get_schema()
             
-            # Generate SQL with LLM
-            prompt = self._create_prompt(natural_query, schema)
-            response = ollama.chat(
-                model=self.model,
-                messages=[{'role': 'user', 'content': prompt}],
-                options={'temperature': 0.1}
-            )
-            sql = response['message']['content'].strip().strip(';')
+            # Generate SQL with Ollama
+            sql = self._generate_sql(query, schema, limit, offset)
             
             # Execute and return
             return {
                 'query': sql,
-                'results': self._execute_sql(sql)
+                'results': self._execute_sql(sql),
+                'total_count': self._get_total_count(sql)  # For pagination
             }
         except Exception as e:
             return {
@@ -82,72 +49,70 @@ class SupplyChainDB:
             }
 
     def _get_schema(self) -> Dict:
-        """Extract schema with sample data"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        """Extract schema information using SQLAlchemy"""
+        inspector = inspect(self.session.bind)
+        columns = inspector.get_columns('supply_chain_orders')
+        sample = self.session.execute(
+            "SELECT * FROM supply_chain_orders LIMIT 3"
+        ).fetchall()
         
-        # Get columns
-        cursor.execute("PRAGMA table_info(supply_chain_orders)")
-        columns = [{'name': col[1], 'type': col[2]} for col in cursor.fetchall()]
-        
-        # Get samples
-        cursor.execute("SELECT * FROM supply_chain_orders LIMIT 3")
-        samples = [dict(zip([col[0] for col in cursor.description], row)) 
-                  for row in cursor.fetchall()]
-        
-        conn.close()
-        return {'columns': columns, 'samples': samples}
+        return {
+            'columns': [{'name': col['name'], 'type': str(col['type'])} for col in columns],
+            'samples': [dict(row) for row in sample]
+        }
 
-    def _create_prompt(self, query: str, schema: Dict) -> str:
-        """Generate precise LLM prompt"""
-        return f"""
-Convert this supply chain query to SQLite SQL:
+    def _generate_sql(self, query: str, schema: Dict, limit: int, offset: int) -> str:
+        """Generate SQL using Ollama with pagination hints"""
+        prompt = f"""
+Convert this supply chain query to SQL:
 "{query}"
 
-Database Schema:
+Schema:
 {json.dumps(schema['columns'], indent=2)}
 
-Sample Rows:
+Sample Data:
 {json.dumps(schema['samples'], indent=2)}
 
 Rules:
-1. Use EXACT column names from schema
-2. For dates: Use 'YYYY-MM-DD' format
-3. For locations: Use full names ('Puerto Rico' not 'PR')
-4. Return ONLY the SQL query, no commentary
+1. Use exact column names
+2. Add LIMIT {limit} OFFSET {offset} for pagination
+3. Return ONLY SQL
+        """
+        response = ollama.chat(
+            model=self.model,
+            messages=[{'role': 'user', 'content': prompt}],
+            options={'temperature': 0.1}
+        )
+        return response['message']['content'].strip().strip(';')
 
-SQL Query:"""
+from sqlalchemy import text
 
-    def _execute_sql(self, sql: str) -> List[Dict]:
-        """Execute SQL safely"""
-        if not self._validate_sql(sql):
-            raise ValueError("Query failed safety check")
-            
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute(sql)
+def _execute_sql(self, sql: str) -> List[Dict]:
+    """Execute SQL safely"""
+    if not self._validate_sql(sql):
+        raise ValueError("Query failed safety check")
         
-        columns = [col[0] for col in cursor.description]
-        results = [dict(zip(columns, row)) for row in cursor.fetchall()]
-        
-        conn.close()
-        return results
+    conn = sqlite3.connect(self.db_path)
+    cursor = conn.cursor()
+    
+    # Explicitly use text() wrapper
+    cursor.execute(text(sql))  # <-- Fix applied
+
+    columns = [col[0] for col in cursor.description]
+    results = [dict(zip(columns, row)) for row in cursor.fetchall()]
+    
+    conn.close()
+    return results
+
+    def _get_total_count(self, sql: str) -> int:
+        """Get total results count for pagination"""
+        try:
+            count_sql = f"SELECT COUNT(*) FROM ({sql}) AS subquery"
+            return self.session.execute(text(count_sql)).scalar()
+        except Exception as e:
+            raise ValueError(f"Count query failed: {str(e)}")
 
     def _validate_sql(self, sql: str) -> bool:
         """Basic SQL injection protection"""
         forbidden = [';', '--', '/*', '*/', 'drop ', 'delete ', 'update ', 'insert ']
         return not any(f in sql.lower() for f in forbidden)
-
-
-# Example Usage
-if __name__ == "__main__":
-    # First-time setup (uncomment to run once)
-    # db = SupplyChainDB(csv_path='your_data.csv')
-    
-    # Normal querying
-    db = SupplyChainDB()  # Reuse existing DB
-    
-    # Sample queries to try:
-    print(db.query("Show 5 orders from Puerto Rico in January 2018"))
-    print(db.query("Which product categories have the most late deliveries?"))
-    print(db.query("List orders with sales over $500"))
